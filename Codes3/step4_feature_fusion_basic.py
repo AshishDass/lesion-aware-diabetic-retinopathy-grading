@@ -1,0 +1,376 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score,
+    matthews_corrcoef, cohen_kappa_score,
+    roc_curve, precision_recall_curve, auc
+)
+import matplotlib.pyplot as plt
+
+# =====================================================
+# DEVICE SETUP
+# =====================================================
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("Using MPS (Apple Silicon GPU)")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+    print("Using CUDA")
+else:
+    device = torch.device("cpu")
+    print("Using CPU")
+
+RESULTS_DIR = "results_early_fusion"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# =====================================================
+# LOAD DATA
+# =====================================================
+df = pd.read_csv("/Users/adass/Research/Codes3/merged_features_labels.csv")
+
+swin_features = df.iloc[:, 0:768].values.astype(np.float32)
+lesion_features = df.iloc[:, 769:797].values.astype(np.float32)
+labels = df["diagnosis"].values.astype(np.int64)
+
+# Normalize lesion features
+scaler = StandardScaler()
+lesion_features = scaler.fit_transform(lesion_features)
+
+# =====================================================
+# TRAIN/VAL SPLIT
+# =====================================================
+X_swin_train, X_swin_val, \
+X_lesion_train, X_lesion_val, \
+y_train, y_val = train_test_split(
+    swin_features,
+    lesion_features,
+    labels,
+    test_size=0.2,
+    stratify=labels,
+    random_state=42
+)
+
+# =====================================================
+# DATASET
+# =====================================================
+class FusionDataset(Dataset):
+    def __init__(self, swin_feat, lesion_feat, labels):
+        self.swin_feat = torch.tensor(swin_feat, dtype=torch.float32)
+        self.lesion_feat = torch.tensor(lesion_feat, dtype=torch.float32)
+        self.labels = torch.tensor(labels, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return (
+            self.swin_feat[idx],
+            self.lesion_feat[idx],
+            self.labels[idx]
+        )
+
+train_loader = DataLoader(
+    FusionDataset(X_swin_train, X_lesion_train, y_train),
+    batch_size=32, shuffle=True
+)
+
+val_loader = DataLoader(
+    FusionDataset(X_swin_val, X_lesion_val, y_val),
+    batch_size=32, shuffle=False
+)
+
+# =====================================================
+# EARLY FUSION MODEL
+# =====================================================
+class EarlyFusionModel(nn.Module):
+    def __init__(self, global_dim=768, lesion_dim=28, num_classes=5):
+        super().__init__()
+
+        fusion_dim = global_dim + lesion_dim
+
+        self.model = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, swin_feat, lesion_feat):
+        fused = torch.cat([swin_feat, lesion_feat], dim=1)
+        return self.model(fused)
+
+model = EarlyFusionModel().to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+
+# =====================================================
+# METRIC FUNCTION
+# =====================================================
+def compute_metrics(labels, preds, probs):
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "precision": precision_score(labels, preds, average="macro", zero_division=0),
+        "recall": recall_score(labels, preds, average="macro", zero_division=0),
+        "f1": f1_score(labels, preds, average="macro", zero_division=0),
+        "auc": roc_auc_score(labels, probs, multi_class="ovr"),
+        "mcc": matthews_corrcoef(labels, preds),
+        "kappa": cohen_kappa_score(labels, preds)
+    }
+
+# =====================================================
+# TRAINING LOOP WITH EARLY STOPPING
+# =====================================================
+epochs = 30
+patience = 5
+best_f1 = 0
+early_stop_counter = 0
+epoch_metrics = []
+
+for epoch in range(epochs):
+
+    # ---------------- TRAIN ----------------
+    model.train()
+    train_preds, train_labels, train_probs = [], [], []
+
+    for swin_feat, lesion_feat, labels_batch in train_loader:
+        swin_feat = swin_feat.to(device)
+        lesion_feat = lesion_feat.to(device)
+        labels_batch = labels_batch.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(swin_feat, lesion_feat)
+        loss = criterion(outputs, labels_batch)
+        loss.backward()
+        optimizer.step()
+
+        probs = torch.softmax(outputs, dim=1)
+        preds = torch.argmax(probs, dim=1)
+
+        train_preds.extend(preds.cpu().numpy())
+        train_labels.extend(labels_batch.cpu().numpy())
+        train_probs.extend(probs.detach().cpu().numpy())
+
+    train_metrics = compute_metrics(train_labels, train_preds, train_probs)
+
+    # ---------------- VALIDATION ----------------
+    model.eval()
+    val_preds, val_labels_list, val_probs = [], [], []
+
+    with torch.no_grad():
+        for swin_feat, lesion_feat, labels_batch in val_loader:
+            swin_feat = swin_feat.to(device)
+            lesion_feat = lesion_feat.to(device)
+            labels_batch = labels_batch.to(device)
+
+            outputs = model(swin_feat, lesion_feat)
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1)
+
+            val_preds.extend(preds.cpu().numpy())
+            val_labels_list.extend(labels_batch.cpu().numpy())
+            val_probs.extend(probs.cpu().numpy())
+
+    val_metrics = compute_metrics(val_labels_list, val_preds, val_probs)
+
+    print(f"\nEpoch {epoch+1}")
+    print(f"Train F1: {train_metrics['f1']:.4f} | "
+          f"Val F1: {val_metrics['f1']:.4f}")
+
+    epoch_metrics.append({
+        "epoch": epoch+1,
+        **{f"train_{k}":v for k,v in train_metrics.items()},
+        **{f"val_{k}":v for k,v in val_metrics.items()}
+    })
+
+    if val_metrics["f1"] > best_f1:
+        best_f1 = val_metrics["f1"]
+        early_stop_counter = 0
+        torch.save(model.state_dict(),
+                   f"{RESULTS_DIR}/best_model.pth")
+    else:
+        early_stop_counter += 1
+
+    if early_stop_counter >= patience:
+        print("Early stopping triggered.")
+        break
+
+pd.DataFrame(epoch_metrics).to_csv(
+    f"{RESULTS_DIR}/epoch_metrics.csv",
+    index=False
+)
+
+# =====================================================
+# FINAL EVALUATION + REPORT GENERATION
+# =====================================================
+
+
+val_labels_array = np.array(val_labels_list)
+val_probs_array = np.array(val_probs)
+val_preds_array = np.array(val_preds)
+
+# ---------------- FINAL METRICS ----------------
+final_metrics = compute_metrics(
+    val_labels_array,
+    val_preds_array,
+    val_probs_array
+)
+
+print("\n========== FINAL PUBLISHABLE RESULTS ==========")
+for k, v in final_metrics.items():
+    print(f"{k.upper()}: {v:.4f}")
+
+# Save TXT
+with open(f"{RESULTS_DIR}/final_report_metrics.txt", "w") as f:
+    for k, v in final_metrics.items():
+        f.write(f"{k.upper()}: {v:.6f}\n")
+
+# Save CSV
+pd.DataFrame([final_metrics]).to_csv(
+    f"{RESULTS_DIR}/final_report_metrics.csv",
+    index=False
+)
+
+# =====================================================
+# ROC CURVE (Per-Class + Micro + Macro)
+# =====================================================
+
+val_labels_bin = label_binarize(val_labels_array, classes=list(range(5)))
+
+plt.figure(figsize=(8,6))
+
+# Per-class ROC
+for i in range(5):
+    fpr, tpr, _ = roc_curve(val_labels_bin[:, i], val_probs_array[:, i])
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f"Class {i} (AUC={roc_auc:.3f})")
+
+# Micro-average ROC
+fpr_micro, tpr_micro, _ = roc_curve(
+    val_labels_bin.ravel(),
+    val_probs_array.ravel()
+)
+roc_auc_micro = auc(fpr_micro, tpr_micro)
+
+plt.plot(fpr_micro, tpr_micro,
+         linestyle='--',
+         linewidth=2,
+         label=f"Micro-average (AUC={roc_auc_micro:.3f})")
+
+# Macro-average ROC
+all_fpr = np.unique(np.concatenate([
+    roc_curve(val_labels_bin[:, i], val_probs_array[:, i])[0]
+    for i in range(5)
+]))
+
+mean_tpr = np.zeros_like(all_fpr)
+
+for i in range(5):
+    fpr, tpr, _ = roc_curve(val_labels_bin[:, i], val_probs_array[:, i])
+    mean_tpr += np.interp(all_fpr, fpr, tpr)
+
+mean_tpr /= 5
+roc_auc_macro = auc(all_fpr, mean_tpr)
+
+plt.plot(all_fpr, mean_tpr,
+         linestyle='-.',
+         linewidth=2,
+         label=f"Macro-average (AUC={roc_auc_macro:.3f})")
+
+plt.plot([0,1],[0,1],'k--')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve - Early Fusion")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{RESULTS_DIR}/ROC.png")
+plt.close()
+
+# =====================================================
+# PR CURVE (Per-Class + Micro + Macro)
+# =====================================================
+
+plt.figure(figsize=(8,6))
+
+# Per-class PR
+for i in range(5):
+    precision_c, recall_c, _ = precision_recall_curve(
+        val_labels_bin[:, i],
+        val_probs_array[:, i]
+    )
+    pr_auc = auc(recall_c, precision_c)
+    plt.plot(recall_c, precision_c,
+             label=f"Class {i} (AUC={pr_auc:.3f})")
+
+# Micro-average PR
+precision_micro, recall_micro, _ = precision_recall_curve(
+    val_labels_bin.ravel(),
+    val_probs_array.ravel()
+)
+pr_auc_micro = auc(recall_micro, precision_micro)
+
+plt.plot(recall_micro, precision_micro,
+         linestyle='--',
+         linewidth=2,
+         label=f"Micro-average (AUC={pr_auc_micro:.3f})")
+
+# Macro-average PR
+all_recall = np.linspace(0,1,100)
+mean_precision = np.zeros_like(all_recall)
+
+for i in range(5):
+    precision_c, recall_c, _ = precision_recall_curve(
+        val_labels_bin[:, i],
+        val_probs_array[:, i]
+    )
+    mean_precision += np.interp(all_recall,
+                                recall_c[::-1],
+                                precision_c[::-1])
+
+mean_precision /= 5
+pr_auc_macro = auc(all_recall, mean_precision)
+
+plt.plot(all_recall, mean_precision,
+         linestyle='-.',
+         linewidth=2,
+         label=f"Macro-average (AUC={pr_auc_macro:.3f})")
+
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("PR Curve - Early Fusion")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{RESULTS_DIR}/PR.png")
+plt.close()
+
+# =====================================================
+# SAVE CONFIDENCE SCORES
+# =====================================================
+
+results_df = pd.DataFrame({
+    "true_label": val_labels_array,
+    "predicted_label": val_preds_array,
+    "confidence": np.max(val_probs_array, axis=1)
+})
+
+for i in range(5):
+    results_df[f"class_{i}_prob"] = val_probs_array[:, i]
+
+results_df.to_csv(
+    f"{RESULTS_DIR}/val_predictions_with_confidence.csv",
+    index=False
+)
+
+print("All evaluation artifacts saved successfully.")
